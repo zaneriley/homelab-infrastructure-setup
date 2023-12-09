@@ -1,0 +1,42 @@
+# Compiled python files
+*.pyc
+*__pycache__
+
+# Retry files created by Ansible
+*.retry
+
+# SSH Keys and Inventory files that may contain credentials
+**/inventory/production
+**/inventory/staging
+**/inventory/*.vault
+inventory
+*.pem
+*.key
+
+# Ansible configuration file based on best practices
+ansible.cfg
+
+# Vault password file
+.vault_pass.txt
+
+# Auto-generated host keys
+host_key_checking
+
+# Folder for Roles downloaded by ansible-galaxy command
+roles/
+
+# Files and directories to ignore in an adjacent technologies project
+*.swp
+*~
+*.bak
+*.tmp
+*.log
+*.tar.gz
+*.zip
+.DS_Store
+.vagrant/
+.secret/
+secrets.yml
+*secrets*
+credentials
+*nodemon.json
