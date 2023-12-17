@@ -1,0 +1,204 @@
+- name: Set up dockeruser and homelab dependencies
+  hosts: nucs
+  become: yes
+  vars:
+    packages:
+      - curl
+      - vim
+      - git
+      - htop
+      - nfs-common
+      - lm-sensors
+      - docker.io
+      - docker-compose
+      - borgbackup
+      - needrestart
+
+  tasks:
+    - name: Include Vault variables
+      include_vars:
+        file: vault.yml
+
+    - name: Update the cache and install necessary packages
+      apt:
+        name: "{{ packages }}"
+        state: latest
+        update_cache: yes
+        cache_valid_time: 3600 # 1 hour
+
+    # - name: Ensure the dockeruser is present and has docker group
+    #   user:
+    #     name: dockeruser
+    #     groups: dockergroup
+    #     append: yes
+    #     system: no
+
+    - name: Disable sleep targets
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: no
+        masked: yes
+      loop:
+        - sleep.target
+        - suspend.target
+        - hibernate.target
+        - hybrid-sleep.target
+
+    - name: Set up BBR for TCP Congestion Control
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+      loop:
+        - { key: "net.core.default_qdisc", value: "fq" }
+        - { key: "net.ipv4.tcp_congestion_control", value: "bbr" }
+      register: tcp_congestion_control_result
+
+- name: Connect to NAS and prepare for streaming
+  hosts: nucs
+  become: yes
+  tasks:
+    - name: Include NAS Variables
+      set_fact:
+        nas_backup_server_path: "{{ hostvars['NAS'].backup_server_path }}"
+        nas_media_server_path: "{{ hostvars['NAS'].media_server_path }}"
+
+    - name: Check if NFS server is reachable
+      wait_for:
+        host: "{{ nas_ip }}"
+        port: 2049
+        state: started
+        timeout: 10
+      register: nfs_server_reachable
+      ignore_errors: yes
+
+    - name: Create media directory for NFS mount if not present
+      file:
+        path: "{{ media_mount_dir }}"
+        state: directory
+      when: nfs_server_reachable is success
+
+    - name: Mount common media NFS share
+      mount:
+        path: "{{ media_mount_dir }}"
+        src: "{{ hostvars['NAS'].ansible_host }}:{{ nas_media_server_path }}"
+        fstype: "nfs"
+        opts: "defaults,_netdev"
+        state: "mounted"
+      when: nfs_server_reachable is success
+
+    - name: Mount specific backup NFS share for each NUC
+      mount:
+        path: "{{ backup_mount_dir }}"
+        src: "{{ hostvars['NAS'].ansible_host }}:{{ nas_backup_server_path }}/{{ inventory_hostname }}"
+        fstype: "nfs"
+        opts: "defaults,_netdev"
+        state: "mounted"
+      when: nfs_server_reachable is success
+
+- name: Set up appropriate homelab docker stack
+  hosts: nucs
+  become: yes
+  tasks:
+    - name: Let ansible have access to /srv directory
+      file:
+        path: "/srv"
+        state: directory
+        owner: ansible
+        group: ansible
+      become: yes  
+
+    - name: Ensure .ssh directory exists for ansible user
+      file:
+        path: "/home/ansible/.ssh"
+        state: directory
+        owner: ansible
+        group: ansible
+        mode: '0700'
+
+    - name: Ensure known_hosts file exists
+      file:
+        path: "/home/ansible/.ssh/known_hosts"
+        state: touch
+        owner: ansible
+        group: ansible
+        mode: '0644'
+        
+    - name: Ensure GitHub's host key is known
+      known_hosts:
+        name: "github.com"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t rsa github.com') }}"
+        state: present
+
+    - name: Ensure SSH is configured to accept GitHub host key on first connect
+      lineinfile:
+        path: "/home/ansible/.ssh/config"
+        create: yes
+        state: present
+        line: |
+          Host github.com
+            StrictHostKeyChecking accept-new
+        owner: ansible
+        group: ansible
+        mode: '0644'
+    
+    - name: Check if GitHub repository is already cloned
+      stat:
+        path: "{{ homelab_srv_folder }}/.git"
+      register: git_repo_check
+
+    - name: Clone GitHub repository
+      git:
+        repo: "{{ github_repo }}"
+        dest: "{{ homelab_srv_folder }}"
+        version: "main"
+      environment:
+        GIT_SSH_COMMAND: "ssh -o ForwardAgent=yes"
+      when: not git_repo_check.stat.exists
+      become: false
+
+
+- name: Check if reboot needed
+  hosts: nucs
+  become: yes
+  tasks:
+
+    - name: Check if a reboot is required for sysctl settings to apply
+      command: needrestart -b
+      register: reboot_required
+      ignore_errors: true
+      changed_when: reboot_required.rc == 0
+      failed_when: reboot_required.rc > 1
+      notify: Reboot System if required 
+
+    - name: Send reboot required notification to Discord
+      uri:
+        url: "{{ discord_webhook }}"
+        method: POST
+        body: '{"content": "**{{ inventory_hostname }}** server has been updated and requires a reboot. Rebooting now..."}'
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        status_code: [200, 204]
+      delegate_to: localhost
+      when: reboot_required.rc == 0
+
+    - name: Send no reboot required notification to Discord
+      uri:
+        url: "{{ discord_webhook }}"
+        method: POST
+        body: '{"content": "**{{ inventory_hostname }}** server has been updated and does not require a reboot. Update complete."}'
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        status_code: [200, 204]
+      delegate_to: localhost
+      when: reboot_required.rc != 0
+
+  handlers:
+    - name: Reboot System if required
+      reboot:
+        test_command: uptime
+        msg: "Reboot initiated by Ansible for applying sysctl settings."
+      listen: "Reboot System if required"
